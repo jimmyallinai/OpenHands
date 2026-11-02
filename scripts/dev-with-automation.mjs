@@ -758,12 +758,15 @@ function spawnService(name, command, args, options = {}) {
     emitServiceLog(name, `failed to start: ${error.message}`, "error");
   });
 
-  proc.on("exit", (code, _signal) => {
+  proc.on("exit", (code, signal) => {
     if (code !== 0 && code !== null && !shuttingDown) {
       logService(name, `Exited with code ${code}`, c.red);
       emitServiceLog(name, `exited with code ${code}`, "error");
     }
     processes.delete(name);
+    if (code !== 0 && !shuttingDown) {
+      options.onUnexpectedExit?.(code ?? `signal ${signal}`);
+    }
   });
 
   processes.set(name, proc);
@@ -1380,6 +1383,44 @@ async function watchAutomationStartup(config, proc, timeoutMs, onFailure) {
   onFailure(new Error(message));
 }
 
+/**
+ * Keep a front-door service (the ingress or the static frontend) running.
+ * When it exits on its own, nothing else answers on the UI port, so start it
+ * again; the ingress has crashed natively on Windows (#19255) while the rest
+ * of the stack kept running. After `maxRestarts` the stack is stopped and
+ * `onFailure` gets the error, like an automation startup failure.
+ * `start(options)` must pass `options` on to `spawnService`.
+ */
+export function superviseService(
+  name,
+  start,
+  { onFailure, maxRestarts = 3, restartDelayMs = 1000 },
+) {
+  let restarts = 0;
+  const launch = () =>
+    start({
+      onUnexpectedExit: async (reason) => {
+        if (restarts < maxRestarts) {
+          restarts += 1;
+          logService(
+            name,
+            `Restarting (${restarts}/${maxRestarts})...`,
+            c.yellow,
+          );
+          setTimeout(launch, restartDelayMs);
+          return;
+        }
+        const message =
+          `The ${name} exited ${maxRestarts + 1} times (last: ${reason}). ` +
+          `Its [${name}] log lines show why.`;
+        logError(message);
+        await stopServices();
+        onFailure(new Error(message));
+      },
+    });
+  launch();
+}
+
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 process.on("SIGHUP", shutdown);
@@ -1409,7 +1450,7 @@ export function buildMarsWebEnv(role, config) {
     : { MARS_WEB: "0" };
 }
 
-function startIngress(config) {
+function startIngress(config, { onUnexpectedExit } = {}) {
   logService("ingress", `Starting on port ${config.ingressPort}...`, c.yellow);
 
   const ingressScript = join(projectRoot, "scripts", "ingress.mjs");
@@ -1437,6 +1478,7 @@ function startIngress(config) {
       cwd: projectRoot,
       color: c.yellow,
       env: buildMarsWebEnv("ingress", config),
+      onUnexpectedExit,
     },
   );
 }
@@ -1773,11 +1815,12 @@ async function main(options = {}) {
     // download / install progress to the user. `level` is one of
     // "stdout" | "stderr" | "info" | "warn" | "error".
     onServiceLog,
-    // Called with an Error when the automation backend exits before it
-    // becomes healthy, after every service has been stopped. That can happen
-    // after `main()` has returned. Defaults to exiting the process with
-    // code 1; embedded launchers (Electron) pass their own handler.
-    onAutomationStartupFailure = () => process.exit(1),
+    // Called with an Error after every service has been stopped because the
+    // stack cannot keep running: the automation backend exited before it
+    // became healthy, or the ingress/static server kept exiting. That can
+    // happen after `main()` has returned. Defaults to exiting the process
+    // with code 1; embedded launchers (Electron) pass their own handler.
+    onStackFailure = () => process.exit(1),
   } = options;
 
   // Install the listener early so log lines emitted before the first
@@ -1941,7 +1984,11 @@ async function main(options = {}) {
   // 4. Start frontend server (Vite dev server OR static server)
   if (config.launchFrontend) {
     if (useStaticMode) {
-      startStaticFrontend(config, staticDir);
+      superviseService(
+        "static",
+        (hooks) => startStaticFrontend(config, staticDir, hooks),
+        { onFailure: onStackFailure },
+      );
     } else {
       startVite(config);
     }
@@ -1951,7 +1998,9 @@ async function main(options = {}) {
   await delay(2000);
 
   // 6. Start ingress proxy (routes traffic only to running services)
-  startIngress(config);
+  superviseService("ingress", (hooks) => startIngress(config, hooks), {
+    onFailure: onStackFailure,
+  });
 
   // Wait for ingress to start
   await delay(1000);
@@ -1965,7 +2014,7 @@ async function main(options = {}) {
       config,
       automationProc,
       agentServerReadyTimeoutMs,
-      onAutomationStartupFailure,
+      onStackFailure,
     );
   }
 
@@ -1975,7 +2024,7 @@ async function main(options = {}) {
   return { config, agentServerReady };
 }
 
-function startStaticFrontend(config, staticDir) {
+function startStaticFrontend(config, staticDir, { onUnexpectedExit } = {}) {
   logService("static", `Starting on port ${config.vitePort}...`, c.magenta);
   logService("static", `Serving from: ${staticDir}`, c.dim);
 
@@ -2038,6 +2087,7 @@ function startStaticFrontend(config, staticDir) {
         ...buildMarsWebEnv("static", config),
         SESSION_API_KEY: keyPolicy.sessionApiKey || "",
       },
+      onUnexpectedExit,
     },
   );
 }
